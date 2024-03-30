@@ -126,7 +126,7 @@ fun Route.collaborationRoute() {
                         row[Follows.followerId].value
                     } + listOf(map.uploaderId.value)
 
-                    val finalRecipients = recipients - nonRecipients.toSet() asd
+                    val finalRecipients = recipients - nonRecipients.toSet()
 
                     Alert.insert(
                         "New Map Collaboration",
