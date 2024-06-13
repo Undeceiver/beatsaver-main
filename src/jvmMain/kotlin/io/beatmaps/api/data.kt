@@ -49,7 +49,9 @@ fun MapDetail.Companion.from(other: BeatmapDao, cdnPrefix: String) = MapDetail(
     other.collaborators.values.map {
         UserDetail.from(it)
     }.ifEmpty { null },
-    other.declaredAi
+    other.declaredAi,
+    other.blRanked,
+    other.blQualified
 )
 fun MapDetail.Companion.from(row: ResultRow, cdnPrefix: String) = from(BeatmapDao.wrapRow(row), cdnPrefix)
 
@@ -72,7 +74,7 @@ fun MapVersion.Companion.from(row: ResultRow, cdnPrefix: String) = from(Versions
 fun MapDifficulty.Companion.from(other: DifficultyDao) = MapDifficulty(
     other.njs, other.offset, other.notes, other.bombs, other.obstacles, other.nps.toDouble(),
     other.length.toDouble(), other.characteristic, other.difficulty, other.events, other.chroma, other.me, other.ne, other.cinema, other.seconds.toDouble(), MapParitySummary.from(other),
-    other.stars?.toFloat(), other.maxScore, if (other.label.isNullOrEmpty()) null else other.label
+    other.stars?.toFloat(), other.maxScore, if (other.label.isNullOrEmpty()) null else other.label, other.blStars?.toFloat()
 )
 
 fun MapParitySummary.Companion.from(other: DifficultyDao) = MapParitySummary(other.pError, other.pWarn, other.pReset)

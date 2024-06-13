@@ -22,6 +22,7 @@ import io.beatmaps.common.db.unaccentLiteral
 import io.beatmaps.common.db.wildcard
 import io.beatmaps.common.dbo.Beatmap
 import io.beatmaps.common.dbo.Difficulty
+import io.beatmaps.common.dbo.Follows
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.Versions
 import io.beatmaps.common.dbo.bookmark
@@ -36,6 +37,7 @@ import io.beatmaps.common.dbo.joinVersions
 import io.beatmaps.common.toQuery
 import io.beatmaps.login.Session
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.optionalAuthorization
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.locations.Location
@@ -48,6 +50,7 @@ import io.ktor.server.sessions.sessions
 import kotlinx.datetime.Instant
 import kotlinx.datetime.toJavaInstant
 import org.jetbrains.exposed.sql.CustomFunction
+import org.jetbrains.exposed.sql.EqOp
 import org.jetbrains.exposed.sql.ExpressionWithColumnType
 import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.Op
@@ -55,7 +58,7 @@ import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.alias
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.intLiteral
-import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
 import java.lang.Integer.toHexString
 import java.util.logging.Logger
@@ -85,6 +88,7 @@ class SearchApi {
         val ranked: Boolean? = null,
         val curated: Boolean? = null,
         val verified: Boolean? = null,
+        val followed: Boolean? = null,
         val fullSpread: Boolean? = null,
         val minDuration: Int? = null,
         val maxDuration: Int? = null,
@@ -115,8 +119,8 @@ class SearchParams(
     val userSubQuery by lazy {
         if (mappers.isNotEmpty()) {
             User
-                .slice(User.id)
-                .select {
+                .select(User.id)
+                .where {
                     User.uniqueName inList mappers.map { m -> m.substring(7) }
                 }
         } else {
@@ -187,108 +191,119 @@ fun Route.searchRoute() {
     }
 
     get<SearchApi.Text>("Search for maps".responds(ok<SearchResponse>())) {
-        call.response.header("Access-Control-Allow-Origin", "*")
-        val sess = call.sessions.get<Session>()
+        optionalAuthorization { _, user ->
+            call.response.header("Access-Control-Allow-Origin", "*")
+            val sess = call.sessions.get<Session>()
 
-        val needsDiff = it.minNps != null || it.maxNps != null
-        val searchFields = PgConcat(" ", Beatmap.name, Beatmap.description, Beatmap.levelAuthorName)
-        val searchInfo = parseSearchQuery(it.q, searchFields, needsDiff)
-        val actualSortOrder = searchInfo.validateSearchOrder(it.sortOrder)
-        val sortArgs = searchInfo.sortArgsFor(actualSortOrder)
+            val needsDiff = it.minNps != null || it.maxNps != null
+            val searchFields = PgConcat(" ", Beatmap.name, Beatmap.description, Beatmap.levelAuthorName)
+            val searchInfo = parseSearchQuery(it.q, searchFields, needsDiff)
+            val actualSortOrder = searchInfo.validateSearchOrder(it.sortOrder)
+            val sortArgs = searchInfo.sortArgsFor(actualSortOrder)
 
-        newSuspendedTransaction {
-            if (searchInfo.escapedQuery != null && searchInfo.escapedQuery.startsWith("key:")) {
-                Beatmap
-                    .slice(Beatmap.id)
-                    .select {
-                        Beatmap.id eq searchInfo.escapedQuery.substring(4).toInt(16) and (Beatmap.deletedAt.isNull())
-                    }
-                    .limit(1).firstOrNull()?.let { r ->
-                        call.respond(SearchResponse(redirect = toHexString(r[Beatmap.id].value)))
-                        return@newSuspendedTransaction
-                    }
-            }
+            newSuspendedTransaction {
+                val followingSubQuery = if (user != null && it.followed == true) {
+                    Follows
+                        .select(Follows.userId)
+                        .where { Follows.followerId eq user.userId }
+                } else {
+                    null
+                }
 
-            val time = measureTime {
-                val beatmaps = Beatmap
-                    .joinVersions(true)
-                    .joinUploader()
-                    .joinCurator()
-                    .joinBookmarked(sess?.userId)
-                    .joinCollaborators()
-                    .slice(
-                        (if (actualSortOrder == SearchOrder.Relevance) listOf(searchInfo.similarRank) else listOf()) +
-                            Beatmap.columns + Versions.columns + Difficulty.columns + User.columns +
-                            curatorAlias.columns + bookmark.columns + collaboratorAlias.columns
-                    )
-                    .select {
-                        Beatmap.id.inSubQuery(
-                            Beatmap
-                                .joinUploader()
-                                .crossJoin(
-                                    Versions
-                                        .let { q ->
-                                            if (needsDiff) q.join(Difficulty, JoinType.INNER, Versions.id, Difficulty.versionId) else q
-                                        }
-                                        .slice(intLiteral(1))
-                                        .select {
-                                            (Versions.mapId eq Beatmap.id) and (Versions.state eq EMapState.Published)
-                                                .notNull(it.minNps) { o -> (Difficulty.nps greaterEqF o) }
-                                                .notNull(it.maxNps) { o -> (Difficulty.nps lessEqF o) }
-                                        }
-                                        .limit(1)
-                                        .lateral().alias("diff")
-                                )
-                                .slice(Beatmap.id)
-                                .select {
-                                    Beatmap.deletedAt.isNull()
-                                        .let { q -> searchInfo.applyQuery(q) }
-                                        .let { q ->
-                                            // Doesn't quite make sense but we want to exclude beat sage by default
-                                            when (it.automapper) {
-                                                true -> q
-                                                false -> q.and(Beatmap.declaredAi neq AiDeclarationType.None)
-                                                null -> q.and(Beatmap.declaredAi eq AiDeclarationType.None)
-                                            }
-                                        }
-                                        .notNull(searchInfo.userSubQuery) { o -> Beatmap.uploader inSubQuery o }
-                                        .notNull(it.chroma) { o -> Beatmap.chroma eq o }
-                                        .notNull(it.noodle) { o -> Beatmap.noodle eq o }
-                                        .notNull(it.ranked) { o -> Beatmap.ranked eq o }
-                                        .notNull(it.curated) { o -> with(Beatmap.curatedAt) { if (o) isNotNull() else isNull() } }
-                                        .notNull(it.verified) { o -> User.verifiedMapper eq o }
-                                        .notNull(it.fullSpread) { o -> Beatmap.fullSpread eq o }
-                                        .notNull(it.minNps) { o -> (Beatmap.maxNps greaterEqF o) }
-                                        .notNull(it.maxNps) { o -> (Beatmap.minNps lessEqF o) }
-                                        .notNull(it.minDuration) { o -> Beatmap.duration greaterEq o }
-                                        .notNull(it.maxDuration) { o -> Beatmap.duration lessEq o }
-                                        .notNull(it.minRating) { o -> Beatmap.score greaterEqF o }
-                                        .notNull(it.maxRating) { o -> Beatmap.score lessEqF o }
-                                        .notNull(it.minBpm) { o -> Beatmap.bpm greaterEq o }
-                                        .notNull(it.maxBpm) { o -> Beatmap.bpm lessEq o }
-                                        .notNull(it.from) { o -> Beatmap.uploaded greaterEq o.toJavaInstant() }
-                                        .notNull(it.to) { o -> Beatmap.uploaded lessEq o.toJavaInstant() }
-                                        .notNull(it.me) { o -> Beatmap.me eq o }
-                                        .notNull(it.cinema) { o -> Beatmap.cinema eq o }
-                                        .notNull(it.tags) { o ->
-                                            o.toQuery()?.applyToQuery() ?: Op.TRUE
-                                        }
-                                        .notNull(it.mapper) { o -> Beatmap.uploader eq o }
-                                        .notNull(it.curator) { o -> Beatmap.curator eq o }
-                                }
-                                .orderBy(*sortArgs)
-                                .limit(it.page)
+                if (searchInfo.escapedQuery != null && searchInfo.escapedQuery.startsWith("key:")) {
+                    Beatmap
+                        .select(Beatmap.id)
+                        .where {
+                            Beatmap.id eq searchInfo.escapedQuery.substring(4).toInt(16) and (Beatmap.deletedAt.isNull())
+                        }
+                        .limit(1).firstOrNull()?.let { r ->
+                            call.respond(SearchResponse(redirect = toHexString(r[Beatmap.id].value)))
+                            return@newSuspendedTransaction
+                        }
+                }
+
+                val time = measureTime {
+                    val beatmaps = Beatmap
+                        .joinVersions(true)
+                        .joinUploader()
+                        .joinCurator()
+                        .joinBookmarked(sess?.userId)
+                        .joinCollaborators()
+                        .select(
+                            (if (actualSortOrder == SearchOrder.Relevance) listOf(searchInfo.similarRank) else listOf()) +
+                                Beatmap.columns + Versions.columns + Difficulty.columns + User.columns +
+                                curatorAlias.columns + bookmark.columns + collaboratorAlias.columns
                         )
-                    }
-                    .orderBy(*sortArgs)
-                    .complexToBeatmap()
-                    .map { m -> MapDetail.from(m, cdnPrefix()) }
+                        .where {
+                            Beatmap.id.inSubQuery(
+                                Beatmap
+                                    .joinUploader()
+                                    .crossJoin(
+                                        Versions
+                                            .let { q ->
+                                                if (needsDiff) q.join(Difficulty, JoinType.INNER, Versions.id, Difficulty.versionId) else q
+                                            }
+                                            .select(intLiteral(1))
+                                            .where {
+                                                EqOp(Versions.mapId, Beatmap.id) and (Versions.state eq EMapState.Published)
+                                                    .notNull(it.minNps) { o -> (Difficulty.nps greaterEqF o) }
+                                                    .notNull(it.maxNps) { o -> (Difficulty.nps lessEqF o) }
+                                            }
+                                            .limit(1)
+                                            .lateral().alias("diff")
+                                    )
+                                    .select(Beatmap.id)
+                                    .where {
+                                        Beatmap.deletedAt.isNull()
+                                            .let { q -> searchInfo.applyQuery(q) }
+                                            .let { q ->
+                                                // Doesn't quite make sense but we want to exclude beat sage by default
+                                                when (it.automapper) {
+                                                    true -> q
+                                                    false -> q.and(Beatmap.declaredAi neq AiDeclarationType.None)
+                                                    null -> q.and(Beatmap.declaredAi eq AiDeclarationType.None)
+                                                }
+                                            }
+                                            .notNull(searchInfo.userSubQuery) { o -> Beatmap.uploader inSubQuery o }
+                                            .notNull(followingSubQuery) { o -> Beatmap.uploader inSubQuery o }
+                                            .notNull(it.chroma) { o -> Beatmap.chroma eq o }
+                                            .notNull(it.noodle) { o -> Beatmap.noodle eq o }
+                                            .notNull(it.ranked) { o -> (Beatmap.ranked eq o) or (Beatmap.blRanked eq o) }
+                                            .notNull(it.curated) { o -> with(Beatmap.curatedAt) { if (o) isNotNull() else isNull() } }
+                                            .notNull(it.verified) { o -> User.verifiedMapper eq o }
+                                            .notNull(it.fullSpread) { o -> Beatmap.fullSpread eq o }
+                                            .notNull(it.minNps) { o -> (Beatmap.maxNps greaterEqF o) }
+                                            .notNull(it.maxNps) { o -> (Beatmap.minNps lessEqF o) }
+                                            .notNull(it.minDuration) { o -> Beatmap.duration greaterEq o }
+                                            .notNull(it.maxDuration) { o -> Beatmap.duration lessEq o }
+                                            .notNull(it.minRating) { o -> Beatmap.score greaterEqF o }
+                                            .notNull(it.maxRating) { o -> Beatmap.score lessEqF o }
+                                            .notNull(it.minBpm) { o -> Beatmap.bpm greaterEq o }
+                                            .notNull(it.maxBpm) { o -> Beatmap.bpm lessEq o }
+                                            .notNull(it.from) { o -> Beatmap.uploaded greaterEq o.toJavaInstant() }
+                                            .notNull(it.to) { o -> Beatmap.uploaded lessEq o.toJavaInstant() }
+                                            .notNull(it.me) { o -> Beatmap.me eq o }
+                                            .notNull(it.cinema) { o -> Beatmap.cinema eq o }
+                                            .notNull(it.tags) { o ->
+                                                o.toQuery()?.applyToQuery() ?: Op.TRUE
+                                            }
+                                            .notNull(it.mapper) { o -> Beatmap.uploader eq o }
+                                            .notNull(it.curator) { o -> Beatmap.curator eq o }
+                                    }
+                                    .orderBy(*sortArgs)
+                                    .limit(it.page)
+                            )
+                        }
+                        .orderBy(*sortArgs)
+                        .complexToBeatmap()
+                        .map { m -> MapDetail.from(m, cdnPrefix()) }
 
-                call.respond(SearchResponse(beatmaps))
-            }
+                    call.respond(SearchResponse(beatmaps))
+                }
 
-            if (time > searchThreshold) {
-                searchLogger.info("Seach took longer than $searchThreshold ($time)\n$sess\n$it")
+                if (time > searchThreshold) {
+                    searchLogger.info("Search took longer than $searchThreshold ($time)\n$sess\n$it")
+                }
             }
         }
     }

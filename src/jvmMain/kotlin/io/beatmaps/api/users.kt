@@ -46,6 +46,8 @@ import io.beatmaps.login.MongoSession
 import io.beatmaps.login.Session
 import io.beatmaps.login.cookieName
 import io.beatmaps.login.server.DBTokenStore
+import io.beatmaps.util.requireAuthorization
+import io.beatmaps.util.requireCaptcha
 import io.beatmaps.util.updateAlertCount
 import io.jsonwebtoken.Claims
 import io.jsonwebtoken.ExpiredJwtException
@@ -272,20 +274,21 @@ fun followData(uploaderId: Int, userId: Int?): UserFollowData {
     fun followingColumn(column: Column<Boolean>) = countWithFilter(userFilter and followerFilter and column) greater intLiteral(0)
     val uploadColumn = followingColumn(Follows.upload)
     val curationColumn = followingColumn(Follows.curation)
+    val collabColumn = followingColumn(Follows.collab)
 
     return Follows
-        .slice(userColumn, followerColumn, followingColumn, uploadColumn, curationColumn).select {
+        .select(userColumn, followerColumn, followingColumn, uploadColumn, curationColumn, collabColumn).where {
             Follows.following and (userFilter or followerFilter)
         }
         .single().let {
-            UserFollowData(it[userColumn], it[followerColumn], it[followingColumn], it[uploadColumn], it[curationColumn])
+            UserFollowData(it[userColumn], it[followerColumn], it[followingColumn], it[uploadColumn], it[curationColumn], it[collabColumn])
         }
 }
 
 fun Route.userRoute() {
     val usernameRegex = Regex("^[._\\-A-Za-z0-9]{3,50}$")
     post<UsersApi.Username> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<AccountDetailReq>()
 
             if (!usernameRegex.matches(req.textContent)) {
@@ -316,7 +319,7 @@ fun Route.userRoute() {
     }
 
     post<UsersApi.Description> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<AccountDetailReq>()
 
             val success = transaction {
@@ -339,7 +342,7 @@ fun Route.userRoute() {
     }
 
     post<UsersApi.Admin> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             if (!sess.isAdmin()) {
                 ActionResponse(false, listOf("Not an admin"))
             } else {
@@ -384,7 +387,7 @@ fun Route.userRoute() {
     }
 
     post<UsersApi.Suspend> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             if (!sess.isAdmin()) {
                 ActionResponse(false, listOf("Not an admin"))
             } else {
@@ -518,7 +521,7 @@ fun Route.userRoute() {
             req.captcha,
             {
                 transaction {
-                    User.select {
+                    User.selectAll().where {
                         (User.email eq req.email) and User.password.isNotNull() and (User.active or User.verifyToken.isNotNull())
                     }.firstOrNull()?.let { UserDao.wrapRow(it) }
                 }?.let { user ->
@@ -547,12 +550,13 @@ fun Route.userRoute() {
     }
 
     get<UsersApi.Sessions> {
-        requireAuthorization {
+        requireAuthorization { _, sess ->
             val oauthSessions = transaction {
                 RefreshTokenTable
                     .join(OauthClient, JoinType.INNER, RefreshTokenTable.clientId, OauthClient.clientId)
-                    .select {
-                        (RefreshTokenTable.userName eq it.userId) and (RefreshTokenTable.expiration greater Clock.System.now().toJavaInstant())
+                    .selectAll()
+                    .where {
+                        (RefreshTokenTable.userName eq sess.userId) and (RefreshTokenTable.expiration greater Clock.System.now().toJavaInstant())
                     }
                     .orderBy(RefreshTokenTable.expiration to SortOrder.DESC)
                     .map { row ->
@@ -568,7 +572,7 @@ fun Route.userRoute() {
 
             val sessionId = call.request.cookies[cookieName]
             val siteSessions = if (MongoClient.connected) {
-                MongoClient.sessions.find(MongoSession::session / Session::userId eq it.userId)
+                MongoClient.sessions.find(MongoSession::session / Session::userId eq sess.userId)
                     .sort(descending(MongoSession::expireAt))
                     .map { row ->
                         SiteSession(
@@ -585,7 +589,7 @@ fun Route.userRoute() {
     }
 
     delete<UsersApi.Sessions> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<SessionRevokeRequest>()
             val userId = req.userId ?: sess.userId
             val sessionId = call.request.cookies[cookieName]
@@ -622,7 +626,7 @@ fun Route.userRoute() {
     }
 
     delete<UsersApi.SessionsById> { byId ->
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<SessionRevokeRequest>()
             val userId = req.userId ?: sess.userId
             val id = UserCrypto.decrypt(byId.id)
@@ -663,14 +667,14 @@ fun Route.userRoute() {
     }
 
     post<UsersApi.Email> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<EmailRequest>()
 
             val response = requireCaptcha(
                 req.captcha,
                 {
                     newSuspendedTransaction {
-                        User.select {
+                        User.selectAll().where {
                             (User.id eq sess.userId)
                         }.firstOrNull()?.let { UserDao.wrapRow(it) }
                     }?.let { user ->
@@ -736,7 +740,7 @@ fun Route.userRoute() {
             val action = untrusted.body.get("action", String::class.java)
 
             newSuspendedTransaction {
-                User.select {
+                User.selectAll().where {
                     User.id eq userId
                 }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
                     try {
@@ -815,7 +819,7 @@ fun Route.userRoute() {
 
                 untrusted.body.subject.toInt().let { userId ->
                     transaction {
-                        User.select {
+                        User.selectAll().where {
                             User.id eq userId
                         }.firstOrNull()?.let { UserDao.wrapRow(it) }?.let { user ->
                             // If the jwt is valid we can reset the user's password :D
@@ -871,7 +875,7 @@ fun Route.userRoute() {
     }
 
     post<UsersApi.Me> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<AccountRequest>()
 
             val response = if (req.password == null || req.currentPassword == null) {
@@ -886,7 +890,7 @@ fun Route.userRoute() {
                     val bcrypt = String(Bcrypt.hash(req.password, 12))
 
                     transaction {
-                        User.select {
+                        User.selectAll().where {
                             User.id eq sess.userId
                         }.firstOrNull()?.let { r ->
                             if (r[User.password]?.let { curPw -> Bcrypt.verify(req.currentPassword, curPw.toByteArray()) } == true) {
@@ -912,7 +916,7 @@ fun Route.userRoute() {
     }
 
     post<UsersApi.Follow> {
-        requireAuthorization { user ->
+        requireAuthorization { _, user ->
             val req = call.receive<UserFollowRequest>()
 
             if (req.userId == user.userId && req.following) {
@@ -921,7 +925,7 @@ fun Route.userRoute() {
             }
 
             transaction {
-                val shouldAlert = Follows.select { (Follows.userId eq req.userId) and (Follows.followerId eq user.userId) }.empty()
+                val shouldAlert = Follows.selectAll().where { (Follows.userId eq req.userId) and (Follows.followerId eq user.userId) }.empty()
 
                 Follows.upsert(conflictIndex = Follows.link) { follow ->
                     follow[userId] = req.userId
@@ -929,10 +933,11 @@ fun Route.userRoute() {
                     follow[since] = NowExpression(since.columnType)
                     follow[upload] = req.upload
                     follow[curation] = req.curation
+                    follow[collab] = req.collab
                     follow[following] = req.following
                 }
                 if (shouldAlert) {
-                    val followedUser = UserDao.wrapRow(User.select { User.id eq req.userId }.single())
+                    val followedUser = UserDao.wrapRow(User.selectAll().where { User.id eq req.userId }.single())
 
                     if (followedUser.followAlerts) {
                         Alert.insert(
@@ -951,7 +956,7 @@ fun Route.userRoute() {
 
     get<UsersApi.Find> {
         val user = transaction {
-            User.select {
+            User.selectAll().where {
                 User.hash.eq(it.id) and User.active
             }.firstOrNull()?.let { row -> UserDetail.from(row) }
         }
@@ -965,7 +970,7 @@ fun Route.userRoute() {
 
     get<UsersApi.List> {
         val us = transaction {
-            val userAlias = User.slice(User.upvotes, User.id, User.name, User.uniqueName, User.description, User.avatar, User.hash, User.discordId).select {
+            val userAlias = User.select(User.upvotes, User.id, User.name, User.uniqueName, User.description, User.avatar, User.hash, User.discordId).where {
                 Op.TRUE and User.active
             }.orderBy(User.upvotes, SortOrder.DESC).limit(it.page).alias("u")
 
@@ -974,7 +979,7 @@ fun Route.userRoute() {
                     Beatmap.deletedAt.isNull()
                 }
                 .join(Versions, JoinType.INNER, onColumn = Beatmap.id, otherColumn = Versions.mapId, additionalConstraint = { Versions.state eq EMapState.Published })
-                .slice(
+                .select(
                     Beatmap.uploader,
                     Beatmap.id.count(),
                     userAlias[User.id],
@@ -989,11 +994,10 @@ fun Route.userRoute() {
                     Beatmap.bpm.avg(),
                     Beatmap.score.avg(3),
                     Beatmap.duration.avg(0),
-                    countWithFilter(Beatmap.ranked),
+                    countWithFilter(Beatmap.ranked or Beatmap.blRanked),
                     Beatmap.uploaded.min(),
                     Beatmap.uploaded.max()
                 )
-                .selectAll()
                 .groupBy(Beatmap.uploader, userAlias[User.id], userAlias[User.upvotes], userAlias[User.name], userAlias[User.uniqueName], userAlias[User.description], userAlias[User.avatar], userAlias[User.hash], userAlias[User.discordId])
                 .orderBy(userAlias[User.upvotes], SortOrder.DESC)
 
@@ -1011,7 +1015,7 @@ fun Route.userRoute() {
                         dao.upvotes,
                         it[Beatmap.downVotesInt.sum()] ?: 0,
                         it[Beatmap.id.count()].toInt(),
-                        it[countWithFilter(Beatmap.ranked)],
+                        it[countWithFilter(Beatmap.ranked or Beatmap.blRanked)],
                         it[Beatmap.bpm.avg()]?.toFloat() ?: 0f,
                         it[Beatmap.score.avg(3)]?.movePointRight(2)?.toFloat() ?: 0f,
                         it[Beatmap.duration.avg(0)]?.toFloat() ?: 0f,
@@ -1029,9 +1033,9 @@ fun Route.userRoute() {
     val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
     get<UsersApi.UserPlaylist> {
         val (maps, user) = transaction {
-            Beatmap.joinVersions().select {
+            Beatmap.joinVersions().selectAll().where {
                 Beatmap.uploader eq it.id and Beatmap.deletedAt.isNull()
-            }.complexToBeatmap().sortedByDescending { b -> b.uploaded } to User.select { User.id eq it.id and User.active }.firstOrNull()?.let { row -> UserDetail.from(row) }
+            }.complexToBeatmap().sortedByDescending { b -> b.uploaded } to User.selectAll().where { User.id eq it.id and User.active }.firstOrNull()?.let { row -> UserDetail.from(row) }
         }
 
         if (user == null) {
@@ -1079,7 +1083,7 @@ fun Route.userRoute() {
                 .join(Versions, JoinType.INNER, Beatmap.id, Versions.mapId) {
                     Versions.state eq EMapState.Published
                 }
-                .slice(
+                .select(
                     Beatmap.id.count(),
                     Beatmap.upVotesInt.sum(),
                     Beatmap.downVotesInt.sum(),
@@ -1089,7 +1093,7 @@ fun Route.userRoute() {
                     countWithFilter(Beatmap.ranked),
                     Beatmap.uploaded.min(),
                     Beatmap.uploaded.max()
-                ).select {
+                ).where {
                     (Beatmap.uploader eq user.id) and (Beatmap.deletedAt.isNull())
                 }.first().let {
                     UserStats(
@@ -1105,14 +1109,14 @@ fun Route.userRoute() {
                     )
                 }
 
-        val cases = EDifficulty.values().associateWith { diffCase(it) }
+        val cases = EDifficulty.entries.associateWith { diffCase(it) }
         val diffStats = Difficulty
             .join(Beatmap, JoinType.INNER, Beatmap.id, Difficulty.mapId)
             .join(Versions, JoinType.INNER, Difficulty.versionId, Versions.id) {
                 Versions.state eq EMapState.Published
             }
-            .slice(Difficulty.id.count(), *cases.values.toTypedArray())
-            .select {
+            .select(Difficulty.id.count(), *cases.values.toTypedArray())
+            .where {
                 (Beatmap.uploader eq user.id) and (Beatmap.deletedAt.isNull())
             }.first().let {
                 fun safeGetCount(diff: EDifficulty) = cases[diff]?.let { c -> it.getOrNull(c) } ?: 0
@@ -1130,17 +1134,17 @@ fun Route.userRoute() {
     }
 
     fun userBy(where: SqlExpressionBuilder.() -> Op<Boolean>) =
-        UserDao.wrapRow(User.joinPatreon().select(where).handlePatreon().firstOrNull() ?: throw NotFoundException())
+        UserDao.wrapRow(User.joinPatreon().selectAll().where(where).handlePatreon().firstOrNull() ?: throw NotFoundException())
 
     get<UsersApi.Me> {
-        requireAuthorization {
+        requireAuthorization { _, sess ->
             val detail = transaction {
                 val user = userBy {
-                    User.id eq it.userId
+                    User.id eq sess.userId
                 }
 
                 val dualAccount = user.discordId != null && user.email != null && user.uniqueName != null
-                val followData = followData(it.userId, it.userId)
+                val followData = followData(sess.userId, sess.userId)
 
                 UserDetail.from(user, stats = statsForUser(user), followData = followData, description = true, patreon = true).let { usr ->
                     if (dualAccount) {
@@ -1191,7 +1195,8 @@ fun Route.userRoute() {
 
         val userDetail = transaction {
             User
-                .select {
+                .selectAll()
+                .where {
                     (User.id inList ids) and User.active
                 }
                 .map { row ->
@@ -1221,8 +1226,8 @@ fun Route.userRoute() {
 
     fun getFollowerData(page: Long, joinOn: Column<EntityID<Int>>, condition: SqlExpressionBuilder.() -> Op<Boolean>) = transaction {
         val followsSubquery = Follows
-            .slice(joinOn, Follows.since)
-            .select { condition() and Follows.following }
+            .select(joinOn, Follows.since)
+            .where { condition() and Follows.following }
             .limit(page)
             .orderBy(Follows.since, SortOrder.DESC)
             .alias("fs")
@@ -1234,10 +1239,9 @@ fun Route.userRoute() {
                 Beatmap.deletedAt.isNull()
             }
             .join(Versions, JoinType.LEFT, onColumn = Beatmap.id, otherColumn = Versions.mapId, additionalConstraint = { Versions.state eq EMapState.Published })
-            .slice(
+            .select(
                 User.columns.plus(Versions.mapId.count()).plus(Patreon.columns)
             )
-            .selectAll()
             .groupBy(User.id, Patreon.id, followsSubquery[Follows.since])
             .orderBy(followsSubquery[Follows.since], SortOrder.DESC)
             .handlePatreon()
@@ -1255,7 +1259,7 @@ fun Route.userRoute() {
     }
 
     get<UsersApi.FollowedBy> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             if (it.user != sess.userId) call.respond(HttpStatusCode.Forbidden)
 
             val users = getFollowerData(it.page, Follows.userId) {
@@ -1269,7 +1273,8 @@ fun Route.userRoute() {
     get<UsersApi.Search> {
         val users = transaction {
             User
-                .select {
+                .selectAll()
+                .where {
                     User.uniqueName startsWith it.q and User.active
                 }
                 .orderBy(length(User.uniqueName), SortOrder.ASC)
@@ -1290,7 +1295,8 @@ fun Route.userRoute() {
         call.response.header("Access-Control-Allow-Origin", "*")
         val users = transaction {
             User
-                .select { User.curator eq Op.TRUE }
+                .selectAll()
+                .where { User.curator eq Op.TRUE }
                 .orderBy(User.seniorCurator to SortOrder.DESC, User.name to SortOrder.ASC)
                 .limit(50)
                 .map { row ->

@@ -12,7 +12,6 @@ import io.beatmaps.api.PlaylistSearchResponse
 import io.beatmaps.api.from
 import io.beatmaps.api.limit
 import io.beatmaps.api.notNull
-import io.beatmaps.api.optionalAuthorization
 import io.beatmaps.api.parseSearchQuery
 import io.beatmaps.common.SearchOrder
 import io.beatmaps.common.api.EPlaylistType
@@ -27,6 +26,7 @@ import io.beatmaps.common.dbo.handleOwner
 import io.beatmaps.common.dbo.joinOwner
 import io.beatmaps.common.dbo.joinPlaylistCurator
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.optionalAuthorization
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.locations.options
@@ -35,13 +35,13 @@ import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import kotlinx.datetime.toJavaInstant
 import org.jetbrains.exposed.sql.Column
-import org.jetbrains.exposed.sql.FieldSet
+import org.jetbrains.exposed.sql.Query
 import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.neq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.or
-import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.sql.transactions.transaction
 
@@ -54,7 +54,7 @@ fun Route.playlistSearch() {
     get<PlaylistApi.ByUploadDate>("Get playlists ordered by created/updated".responds(ok<PlaylistSearchResponse>())) {
         call.response.header("Access-Control-Allow-Origin", "*")
 
-        optionalAuthorization(OauthScope.PLAYLISTS) { sess ->
+        optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
             val sortField = when (it.sort) {
                 null, LatestPlaylistSort.CREATED -> Playlist.createdAt
                 LatestPlaylistSort.SONGS_UPDATED -> Playlist.songsChangedAt
@@ -68,12 +68,12 @@ fun Route.playlistSearch() {
                     .joinMaps()
                     .joinPlaylistCurator()
                     .joinOwner()
-                    .slice(Playlist.columns + User.columns + curatorAlias.columns + Playlist.Stats.all)
-                    .select {
+                    .select(Playlist.columns + User.columns + curatorAlias.columns + Playlist.Stats.all)
+                    .where {
                         Playlist.id.inSubQuery(
                             Playlist
-                                .slice(Playlist.id)
-                                .select {
+                                .select(Playlist.id)
+                                .where {
                                     (Playlist.deletedAt.isNull() and (sess?.let { s -> Playlist.owner eq s.userId or (Playlist.type eq EPlaylistType.Public) } ?: (Playlist.type eq EPlaylistType.Public)))
                                         .notNull(it.before) { o -> sortField less o.toJavaInstant() }
                                         .notNull(it.after) { o -> sortField greater o.toJavaInstant() }
@@ -120,16 +120,16 @@ fun Route.playlistSearch() {
                 .joinMaps()
                 .joinOwner()
                 .joinPlaylistCurator()
-                .slice(
+                .select(
                     (if (actualSortOrder == SearchOrder.Relevance) listOf(searchInfo.similarRank) else listOf()) +
                         Playlist.columns + User.columns + curatorAlias.columns + Playlist.Stats.all
                 )
-                .select {
+                .where {
                     Playlist.id.inSubQuery(
                         Playlist
                             .joinOwner()
-                            .slice(Playlist.id)
-                            .select {
+                            .select(Playlist.id)
+                            .where {
                                 (Playlist.deletedAt.isNull() and (Playlist.type inList EPlaylistType.entries.filter { v -> v.anonymousAllowed }))
                                     .let { q -> searchInfo.applyQuery(q) }
                                     .let { q ->
@@ -169,15 +169,15 @@ fun Route.playlistSearch() {
     get<PlaylistApi.ByUser>("Get playlists by user".responds(ok<PlaylistSearchResponse>())) { req ->
         call.response.header("Access-Control-Allow-Origin", "*")
 
-        optionalAuthorization(OauthScope.PLAYLISTS) { sess ->
-            fun <T> doQuery(table: FieldSet = Playlist, groupBy: Array<Column<*>> = arrayOf(Playlist.id), block: (ResultRow) -> T) =
+        optionalAuthorization(OauthScope.PLAYLISTS) { _, sess ->
+            fun <T> doQuery(table: Query = Playlist.selectAll(), groupBy: Array<Column<*>> = arrayOf(Playlist.id), block: (ResultRow) -> T) =
                 transaction {
                     table
-                        .select {
+                        .where {
                             Playlist.id.inSubQuery(
                                 Playlist
-                                    .slice(Playlist.id)
-                                    .select {
+                                    .select(Playlist.id)
+                                    .where {
                                         ((Playlist.owner eq req.userId) and Playlist.deletedAt.isNull()).let {
                                             if (req.userId == sess?.userId) {
                                                 it
@@ -215,7 +215,7 @@ fun Route.playlistSearch() {
                         .joinMaps()
                         .joinOwner()
                         .joinPlaylistCurator()
-                        .slice(Playlist.columns + User.columns + curatorAlias.columns + Playlist.Stats.all),
+                        .select(Playlist.columns + User.columns + curatorAlias.columns + Playlist.Stats.all),
                     arrayOf(Playlist.id, User.id, curatorAlias[User.id])
                 ) {
                     PlaylistFull.from(it, cdnPrefix())

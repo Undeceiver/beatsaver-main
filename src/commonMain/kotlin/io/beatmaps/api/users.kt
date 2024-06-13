@@ -15,7 +15,7 @@ enum class PatreonTier(val pledge: Int, val supporting: Boolean, val title: Stri
 
     companion object {
         const val maxWipsMessage = "Too many unpublished maps. Either delete or publish your existing maps. To gain additional unpublished slots become a site supporter."
-        fun fromPledge(pledge: Int) = values().filter { it.pledge >= pledge }.minBy { it.pledge }
+        fun fromPledge(pledge: Int) = entries.filter { it.pledge >= pledge }.minBy { it.pledge }
     }
 }
 
@@ -69,7 +69,8 @@ data class UserFollowData(
     val follows: Int?,
     val following: Boolean,
     val upload: Boolean,
-    val curation: Boolean
+    val curation: Boolean,
+    val collab: Boolean
 )
 
 @Serializable
@@ -110,7 +111,7 @@ data class UserAdminRequest(val userId: Int, val maxUploadSize: Int, val curator
 data class UserSuspendRequest(val userId: Int, val suspended: Boolean, val reason: String?)
 
 @Serializable
-data class UserFollowRequest(val userId: Int, val following: Boolean, val upload: Boolean, val curation: Boolean)
+data class UserFollowRequest(val userId: Int, val following: Boolean, val upload: Boolean, val curation: Boolean, val collab: Boolean)
 
 @Serializable
 data class SessionRevokeRequest(val userId: Int? = null, val site: Boolean? = null, val reason: String? = null)

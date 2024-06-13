@@ -2,7 +2,6 @@ package io.beatmaps.api
 
 import io.beatmaps.common.api.EAlertType
 import io.beatmaps.common.db.NowExpression
-import io.beatmaps.common.db.updateReturning
 import io.beatmaps.common.dbo.Alert
 import io.beatmaps.common.dbo.Beatmap
 import io.beatmaps.common.dbo.BeatmapDao
@@ -12,8 +11,10 @@ import io.beatmaps.common.dbo.Follows
 import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.UserDao
 import io.beatmaps.common.dbo.collaboratorAlias
+import io.beatmaps.common.dbo.joinUploader
 import io.beatmaps.util.cdnPrefix
 import io.beatmaps.util.isUploader
+import io.beatmaps.util.requireAuthorization
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.locations.Location
@@ -26,11 +27,15 @@ import kotlinx.datetime.toKotlinInstant
 import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.SortOrder
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.alias
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insertAndGetId
-import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.sql.vendors.ForUpdateOption
 
 fun CollaborationDetail.Companion.from(row: ResultRow, cdnPrefix: String) = CollaborationDao.wrapRow(row).let {
     CollaborationDetail(
@@ -60,7 +65,7 @@ class CollaborationApi {
 
 fun Route.collaborationRoute() {
     post<CollaborationApi.CollaborationRequest> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<CollaborationRequestData>()
 
             val success = transaction {
@@ -70,7 +75,7 @@ fun Route.collaborationRoute() {
                             it[mapId] = req.mapId
                             it[collaboratorId] = req.collaboratorId
                             it[requestedAt] = NowExpression(requestedAt.columnType)
-                            it[uploadedAt] = Beatmap.slice(Beatmap.uploaded).select { Beatmap.id eq req.mapId }
+                            it[uploadedAt] = Beatmap.select(Beatmap.uploaded).where { Beatmap.id eq req.mapId }
                         }
                     }
                 }
@@ -81,63 +86,70 @@ fun Route.collaborationRoute() {
     }
 
     post<CollaborationApi.CollaborationResponse> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<CollaborationResponseData>()
 
             val success = transaction {
-                val mapId =
-                    if (req.accepted) {
-                        Collaboration.updateReturning(
-                            {
-                                Collaboration.id eq req.collaborationId and (Collaboration.collaboratorId eq sess.userId)
-                            },
-                            {
-                                it[accepted] = true
-                            },
-                            Collaboration.mapId
-                        )
-                    } else {
-                        Collaboration.deleteWhere {
+                if (req.accepted) {
+                    val (collab, map) = Collaboration
+                        .join(Beatmap, JoinType.LEFT, Collaboration.mapId, Beatmap.id) { Beatmap.deletedAt.isNull() }
+                        .joinUploader()
+                        .selectAll()
+                        .where {
                             Collaboration.id eq req.collaborationId and (Collaboration.collaboratorId eq sess.userId)
                         }
+                        .forUpdate(ForUpdateOption.PostgreSQL.ForUpdate(null, Collaboration))
+                        .singleOrNull()
+                        ?.let {
+                            UserDao.wrapRow(it)
+                            CollaborationDao.wrapRow(it) to BeatmapDao.wrapRow(it)
+                        } ?: (null to null)
 
-                        null
-                    }.let {
-                        it?.firstOrNull()
-                    }
+                    if (collab?.accepted == true) {
+                        true
+                    } else if (map != null && collab != null) {
+                        // Set to accepted
+                        Collaboration.update({
+                            Collaboration.id eq collab.id
+                        }) {
+                            it[accepted] = true
+                        }
 
-                if (mapId != null) {
-                    // Generate alert for followers of the collaborator.
-                    val map = mapId.let {
-                        BeatmapDao.wrapRow(Beatmap.select {
-                            Beatmap.id eq it[Collaboration.mapId].value
-                        }.single())
-                    }
+                        // Generate alert for followers of the collaborator.
+                        val followsAlias = Follows.alias("f2")
+                        val recipients = Follows
+                            .join(followsAlias, JoinType.LEFT, followsAlias[Follows.followerId], Follows.followerId) {
+                                (followsAlias[Follows.userId] eq map.uploaderId) and followsAlias[Follows.following]
+                            }
+                            .select(Follows.followerId)
+                            .where {
+                                followsAlias[Follows.id].isNull() and (Follows.followerId neq map.uploaderId) and
+                                    (Follows.userId eq sess.userId) and Follows.collab and Follows.following
+                            }
+                            .map { row ->
+                                row[Follows.followerId].value
+                            }
 
-                    val recipients = Follows.select {
-                        Follows.userId eq sess.userId and Follows.upload and Follows.following
-                    }.map { row ->
-                        row[Follows.followerId].value
-                    }
-
-                    val nonRecipients = Follows.select {
-                        Follows.userId eq map.uploaderId and Follows.following
-                    }.map { row ->
-                        row[Follows.followerId].value
-                    } + listOf(map.uploaderId.value)
-
-                    val finalRecipients = recipients - nonRecipients.toSet()
-
-                    Alert.insert(
-                        "New Map Collaboration",
-                        "@${sess.uniqueName} collaborated with @${map.uploader.uniqueName} on #${Integer.toHexString(map.id.value)}: **${map.name}**.\n" +
+                        Alert.insert(
+                            "New Map Collaboration",
+                            "@${sess.uniqueName} collaborated with @${map.uploader.uniqueName} on #${
+                                Integer.toHexString(
+                                    map.id.value
+                                )
+                            }: **${map.name}**.\n" +
                                 "*\"${map.description.replace(Regex("\n+"), " ").take(100)}...\"*",
-                        EAlertType.MapRelease,
-                        finalRecipients
-                    )
+                            EAlertType.MapRelease,
+                            recipients
+                        )
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    Collaboration.deleteWhere {
+                        id eq req.collaborationId and (collaboratorId eq sess.userId)
+                    } > 0
                 }
-
-                mapId != null
             }
 
             call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.Unauthorized)
@@ -145,13 +157,13 @@ fun Route.collaborationRoute() {
     }
 
     post<CollaborationApi.CollaborationRemove> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val req = call.receive<CollaborationRemoveData>()
 
             val success = transaction {
                 (isUploader(req.mapId, sess.userId) || sess.isAdmin()) &&
                     Collaboration.deleteWhere {
-                        Collaboration.mapId eq req.mapId and (Collaboration.collaboratorId eq req.collaboratorId)
+                        mapId eq req.mapId and (collaboratorId eq req.collaboratorId)
                     } > 0
             }
 
@@ -160,14 +172,15 @@ fun Route.collaborationRoute() {
     }
 
     get<CollaborationApi.Collaborations> {
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val mapId = it.id.toInt(16)
 
             val collaborations = transaction {
                 if (isUploader(mapId, sess.userId) || sess.admin) {
                     Collaboration
                         .join(collaboratorAlias, JoinType.LEFT, Collaboration.collaboratorId, collaboratorAlias[User.id])
-                        .select {
+                        .selectAll()
+                        .where {
                             Collaboration.mapId eq mapId
                         }
                         .orderBy(Collaboration.accepted, SortOrder.DESC)

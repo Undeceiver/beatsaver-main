@@ -61,7 +61,6 @@ import react.dom.th
 import react.dom.thead
 import react.dom.tr
 import react.dom.ul
-import react.key
 import react.ref
 import react.setState
 
@@ -121,7 +120,7 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
     private val onHashChange = { _: Event? ->
         val hash = window.location.hash.substring(1)
         val tabContext = TabContext(props.params["userId"]?.toIntOrNull())
-        val newState = ProfileTab.values().firstOrNull { hash == it.tabText.lowercase() && it.condition(props, tabContext, state) } ?: state.state
+        val newState = ProfileTab.entries.firstOrNull { hash == it.tabText.lowercase() && it.condition(props, tabContext, state) } ?: state.state
         setState {
             state = newState
         }
@@ -167,9 +166,9 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
         val hash = window.location.hash.substring(1)
         val tabContext = TabContext(props.params["userId"]?.toIntOrNull())
         setState {
-            state = ProfileTab.values().firstOrNull {
+            state = ProfileTab.entries.firstOrNull {
                 hash == it.tabText.lowercase() && it.condition(props, tabContext, this)
-            } ?: ProfileTab.values().firstOrNull { it.bootCondition() && it.condition(props, tabContext, this) } ?: run {
+            } ?: ProfileTab.entries.firstOrNull { it.bootCondition() && it.condition(props, tabContext, this) } ?: run {
                 if (ProfileTab.UNPUBLISHED.condition(props, tabContext, this)) {
                     ProfileTab.UNPUBLISHED
                 } else {
@@ -183,9 +182,9 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
         window.addEventListener("hashchange", onHashChange)
     }
 
-    private fun setFollowStatus(following: Boolean, upload: Boolean, curation: Boolean) {
+    private fun setFollowStatus(following: Boolean, upload: Boolean, curation: Boolean, collab: Boolean) {
         setState { loading = true }
-        val req = UserFollowRequest(state.userDetail?.id ?: 0, following, upload, curation)
+        val req = UserFollowRequest(state.userDetail?.id ?: 0, following, upload, curation, collab)
         Axios.post<UserFollowRequest>("${Config.apibase}/users/follow", req, generateConfig<UserFollowRequest, String>()).then({
             setState {
                 loading = false
@@ -202,7 +201,8 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
                     followData?.follows,
                     following,
                     upload,
-                    curation
+                    curation,
+                    collab
                 )
             }
         }) { }
@@ -314,7 +314,7 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
                                                     attrs.disabled = state.loading == true
                                                     attrs.onClickFunction = { e ->
                                                         e.preventDefault()
-                                                        setFollowStatus(!fd.following, !fd.following, !fd.following)
+                                                        setFollowStatus(!fd.following, !fd.following, !fd.following, !fd.following)
                                                     }
 
                                                     if (fd.following) {
@@ -344,10 +344,10 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
                                                             input(InputType.checkBox, classes = "form-check-input me-2") {
                                                                 attrs.id = "follow-uploads"
                                                                 attrs.disabled = state.loading == true
-                                                                attrs.defaultChecked = fd.upload
+                                                                attrs.checked = fd.upload
                                                                 attrs.onChangeFunction = { ev ->
                                                                     val newUpload = (ev.target as HTMLInputElement).checked
-                                                                    setFollowStatus(fd.following || newUpload || fd.curation, newUpload, fd.curation)
+                                                                    setFollowStatus(fd.following || newUpload || fd.curation || fd.collab, newUpload, fd.curation, fd.collab)
                                                                 }
                                                             }
                                                             +"Uploads"
@@ -361,13 +361,31 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
                                                             input(InputType.checkBox, classes = "form-check-input me-2") {
                                                                 attrs.id = "follow-curations"
                                                                 attrs.disabled = state.loading == true
-                                                                attrs.defaultChecked = fd.curation
+                                                                attrs.checked = fd.curation
                                                                 attrs.onChangeFunction = { ev ->
                                                                     val newCuration = (ev.target as HTMLInputElement).checked
-                                                                    setFollowStatus(fd.following || fd.upload || newCuration, fd.upload, newCuration)
+                                                                    setFollowStatus(fd.following || fd.upload || newCuration || fd.collab, fd.upload, newCuration, fd.collab)
                                                                 }
                                                             }
                                                             +"Curations"
+                                                        }
+
+                                                        label("dropdown-item") {
+                                                            attrs.htmlFor = "follow-collabs"
+                                                            attrs.role = "button"
+                                                            attrs.onClickFunction = {
+                                                                it.stopPropagation()
+                                                            }
+                                                            input(InputType.checkBox, classes = "form-check-input me-2") {
+                                                                attrs.id = "follow-collabs"
+                                                                attrs.disabled = state.loading == true
+                                                                attrs.checked = fd.collab
+                                                                attrs.onChangeFunction = { ev ->
+                                                                    val newCollab = (ev.target as HTMLInputElement).checked
+                                                                    setFollowStatus(fd.following || fd.upload || fd.curation || newCollab, fd.upload, fd.curation, newCollab)
+                                                                }
+                                                            }
+                                                            +"Collabs"
                                                         }
                                                     }
                                                 }
@@ -476,7 +494,7 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
             val userId = props.params["userId"]?.toIntOrNull()
             ul("nav nav-minimal mb-3") {
                 val tabContext = TabContext(userId)
-                ProfileTab.values().forEach { tab ->
+                ProfileTab.entries.forEach { tab ->
                     if (!tab.condition(props, tabContext, state)) return@forEach
 
                     li("nav-item") {
@@ -529,6 +547,8 @@ class ProfilePage : RComponent<ProfilePageProps, ProfilePageState>() {
             if (state.state == ProfileTab.REVIEWS) {
                 reviewTable {
                     attrs.userDetail = detail
+                    // There may be collaborators passed here, however they are not passed here as they are not required
+                    // And would just result in the purposeless loading of additional data
                 }
             }
 

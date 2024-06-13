@@ -29,6 +29,7 @@ import io.beatmaps.common.dbo.User
 import io.beatmaps.common.dbo.Versions
 import io.beatmaps.common.dbo.complexToBeatmap
 import io.beatmaps.common.dbo.joinBookmarked
+import io.beatmaps.common.dbo.joinCollaborations
 import io.beatmaps.common.dbo.joinCollaborators
 import io.beatmaps.common.dbo.joinCurator
 import io.beatmaps.common.dbo.joinUploader
@@ -36,6 +37,7 @@ import io.beatmaps.common.dbo.joinVersions
 import io.beatmaps.common.pub
 import io.beatmaps.login.Session
 import io.beatmaps.util.cdnPrefix
+import io.beatmaps.util.requireAuthorization
 import io.beatmaps.util.updateAlertCount
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
@@ -191,7 +193,7 @@ fun Route.mapDetailRoute() {
 
     post<MapsApi.Curate> {
         call.response.header("Access-Control-Allow-Origin", "*")
-        requireAuthorization { user ->
+        requireAuthorization { _, user ->
             if (!user.isCurator()) {
                 call.respond(HttpStatusCode.BadRequest)
             } else {
@@ -214,7 +216,7 @@ fun Route.mapDetailRoute() {
 
                     (curateMap() > 0).also { success ->
                         if (success) {
-                            Beatmap.joinUploader().select {
+                            Beatmap.joinUploader().selectAll().where {
                                 Beatmap.id eq mapUpdate.id
                             }.complexToBeatmap().single().let {
                                 // Handle alerts for curation
@@ -231,7 +233,7 @@ fun Route.mapDetailRoute() {
                                         )
                                     }
 
-                                    val recipients = Follows.select {
+                                    val recipients = Follows.selectAll().where {
                                         Follows.userId eq user.userId and Follows.curation and Follows.following
                                     }.map { row ->
                                         row[Follows.followerId].value
@@ -268,7 +270,7 @@ fun Route.mapDetailRoute() {
 
     post<MapsApi.DeclareAi> {
         call.response.header("Access-Control-Allow-Origin", "*")
-        requireAuthorization { user ->
+        requireAuthorization { _, user ->
             val mapUpdate = call.receive<AiDeclaration>()
             val result = transaction {
                 val admin = user.isAdmin()
@@ -297,7 +299,7 @@ fun Route.mapDetailRoute() {
 
     post<MapsApi.Update> {
         call.response.header("Access-Control-Allow-Origin", "*")
-        requireAuthorization { user ->
+        requireAuthorization { _, user ->
             val mapUpdate = call.receive<MapInfoUpdate>()
 
             val tooMany = mapUpdate.tags?.groupBy { it.type }?.mapValues { it.value.size }?.withDefault { 0 }?.let { byType ->
@@ -306,7 +308,7 @@ fun Route.mapDetailRoute() {
 
             val result = transaction {
                 val oldData = if (user.isAdmin()) {
-                    BeatmapDao.wrapRow(Beatmap.select { Beatmap.id eq mapUpdate.id }.single())
+                    BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
                 } else {
                     null
                 }
@@ -327,7 +329,7 @@ fun Route.mapDetailRoute() {
                             mapUpdate.name?.let { n -> it[name] = n.take(1000) }
                             mapUpdate.description?.let { d -> it[description] = d.take(10000) }
                             if (tooMany != true) { // Don't update tags if request is trying to add too many tags
-                                mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t.toTypedArray() }
+                                mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t }
                             }
                             it[updatedAt] = NowExpression(updatedAt.columnType)
                         }
@@ -367,7 +369,7 @@ fun Route.mapDetailRoute() {
 
     post<MapsApi.TagUpdate> {
         call.response.header("Access-Control-Allow-Origin", "*")
-        requireAuthorization { user ->
+        requireAuthorization { _, user ->
             val mapUpdate = call.receive<SimpleMapInfoUpdate>()
 
             val tooMany = mapUpdate.tags?.groupBy { it.type }?.mapValues { it.value.size }?.withDefault { 0 }?.let { byType ->
@@ -376,13 +378,13 @@ fun Route.mapDetailRoute() {
 
             val result = if (tooMany != true && user.isCurator()) {
                 transaction {
-                    val oldData = BeatmapDao.wrapRow(Beatmap.select { Beatmap.id eq mapUpdate.id }.single())
+                    val oldData = BeatmapDao.wrapRow(Beatmap.selectAll().where { Beatmap.id eq mapUpdate.id }.single())
 
                     fun updateMap() =
                         Beatmap.update({
                             Beatmap.id eq mapUpdate.id and Beatmap.deletedAt.isNull()
                         }) {
-                            mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t.toTypedArray() }
+                            mapUpdate.tags?.filter { t -> t != MapTag.None }?.map { t -> t.slug }?.let { t -> it[tags] = t }
                             it[updatedAt] = NowExpression(updatedAt.columnType)
                         }
 
@@ -418,7 +420,8 @@ fun Route.mapDetailRoute() {
                     .joinCurator()
                     .joinBookmarked(sess?.userId)
                     .joinCollaborators()
-                    .select {
+                    .selectAll()
+                    .where {
                         (Beatmap.id eq it.id.toInt(16)).let {
                             if (isAdmin) {
                                 it
@@ -448,13 +451,13 @@ fun Route.mapDetailRoute() {
     get<MapsApi.InPlaylists> {
         val mapId = it.id
 
-        requireAuthorization {
+        requireAuthorization { _, sess ->
             try {
                 transaction {
                     Playlist.joinMaps {
                         PlaylistMap.mapId eq mapId.toInt(16)
-                    }.select {
-                        Playlist.owner eq it.userId and Playlist.deletedAt.isNull() and (Playlist.type neq EPlaylistType.Search)
+                    }.selectAll().where {
+                        Playlist.owner eq sess.userId and Playlist.deletedAt.isNull() and (Playlist.type neq EPlaylistType.Search)
                     }.orderBy(Playlist.createdAt, SortOrder.DESC).map { row ->
                         PlaylistDao.wrapRow(row) to (row.getOrNull(PlaylistMap.id) != null)
                     }
@@ -477,11 +480,12 @@ fun Route.mapDetailRoute() {
                 .joinVersions(true)
                 .joinUploader()
                 .joinCurator()
-                .select {
+                .selectAll()
+                .where {
                     Beatmap.id.inSubQuery(
                         Versions
-                            .slice(Versions.mapId)
-                            .select {
+                            .select(Versions.mapId)
+                            .where {
                                 Versions.key64 eq it.key
                             }
                             .limit(1)
@@ -506,7 +510,8 @@ fun Route.mapDetailRoute() {
             transaction {
                 Beatmap
                     .joinVersions(true)
-                    .select {
+                    .selectAll()
+                    .where {
                         Beatmap.id eq k.key.toInt(16) and (Beatmap.deletedAt.isNull())
                     }
                     .complexToBeatmap()
@@ -539,7 +544,8 @@ fun Route.mapDetailRoute() {
                     .joinCurator()
                     .joinBookmarked(sess?.userId)
                     .joinCollaborators()
-                    .select {
+                    .selectAll()
+                    .where {
                         Beatmap.id.inList(
                             mapIdList.mapNotNull { id -> id.toIntOrNull(16) }
                         ) and (Beatmap.deletedAt.isNull())
@@ -566,8 +572,8 @@ fun Route.mapDetailRoute() {
         call.response.header("Access-Control-Allow-Origin", "*")
         val r = transaction {
             val versions = Versions
-                .slice(Versions.mapId, Versions.hash)
-                .select {
+                .select(Versions.mapId, Versions.hash)
+                .where {
                     Versions.hash.inList(it.hash.lowercase().split(',', ignoreCase = false).take(50))
                 }
             val versionMapping = versions.associate { it[Versions.hash] to it[Versions.mapId].value }
@@ -578,7 +584,8 @@ fun Route.mapDetailRoute() {
                 .joinUploader()
                 .joinCurator()
                 .joinCollaborators()
-                .select {
+                .selectAll()
+                .where {
                     Beatmap.id.inList(mapIds) and (Beatmap.deletedAt.isNull())
                 }
                 .complexToBeatmap()
@@ -606,14 +613,15 @@ fun Route.mapDetailRoute() {
     }
 
     get<MapsApi.WIP> { r ->
-        requireAuthorization { sess ->
+        requireAuthorization { _, sess ->
             val beatmaps = transaction {
                 Beatmap
                     .joinVersions(true, state = null)
                     .joinUploader()
                     .joinCurator()
                     .joinBookmarked(sess.userId)
-                    .select {
+                    .selectAll()
+                    .where {
                         Beatmap.id.inSubQuery(
                             Beatmap
                                 .join(
@@ -623,8 +631,8 @@ fun Route.mapDetailRoute() {
                                     otherColumn = Versions.mapId,
                                     additionalConstraint = { Versions.state eq EMapState.Published }
                                 )
-                                .slice(Beatmap.id)
-                                .select {
+                                .select(Beatmap.id)
+                                .where {
                                     Beatmap.uploader.eq(sess.userId) and Beatmap.deletedAt.isNull() and Versions.mapId.isNull()
                                 }
                                 .groupBy(Beatmap.id)
@@ -653,12 +661,13 @@ fun Route.mapDetailRoute() {
                 .joinUploader()
                 .joinCurator()
                 .joinBookmarked(sess?.userId)
-                .select {
+                .selectAll()
+                .where {
                     Beatmap.id.inSubQuery(
                         Beatmap
                             .joinVersions()
-                            .slice(Beatmap.id)
-                            .select {
+                            .select(Beatmap.id)
+                            .where {
                                 Beatmap.uploader.eq(it.id) and (Beatmap.deletedAt.isNull())
                             }
                             .orderBy(Beatmap.uploaded to SortOrder.DESC)
@@ -681,11 +690,12 @@ fun Route.mapDetailRoute() {
         val sess = call.sessions.get<Session>()
         val pageSize = (it.pageSize ?: 20).coerceIn(1, 100)
         val beatmaps = transaction {
-            val collabQuery = Collaboration
+            val collabQuery = Beatmap
+                .joinCollaborations()
                 .joinVersions(column = Collaboration.mapId)
-                .slice(Collaboration.mapId, Collaboration.uploadedAt)
-                .select {
-                    (Collaboration.collaboratorId eq it.id and Collaboration.accepted)
+                .select(Collaboration.mapId, Collaboration.uploadedAt)
+                .where {
+                    (Collaboration.collaboratorId eq it.id and Collaboration.accepted and Beatmap.deletedAt.isNull())
                         .notNull(it.before) { o -> Collaboration.uploadedAt less o.toJavaInstant() }
                 }
                 .orderBy(Collaboration.uploadedAt to SortOrder.DESC)
@@ -693,8 +703,8 @@ fun Route.mapDetailRoute() {
 
             val uploadQuery = Beatmap
                 .joinVersions()
-                .slice(Beatmap.id, Beatmap.uploaded)
-                .select {
+                .select(Beatmap.id, Beatmap.uploaded)
+                .where {
                     (Beatmap.uploader eq it.id and Beatmap.deletedAt.isNull())
                         .notNull(it.before) { o -> Beatmap.uploaded less o.toJavaInstant() }
                 }
@@ -707,12 +717,12 @@ fun Route.mapDetailRoute() {
                 .joinCurator()
                 .joinBookmarked(sess?.userId)
                 .joinCollaborators()
-                .select {
+                .selectAll()
+                .where {
                     Beatmap.id.inSubQuery(
                         collabQuery.unionAll(uploadQuery).alias("tm").let { u ->
                             u
-                                .slice(u[Collaboration.mapId])
-                                .selectAll()
+                                .select(u[Collaboration.mapId])
                                 .orderBy(u[Collaboration.uploadedAt] to SortOrder.DESC)
                                 .limit(20)
                         }
@@ -751,13 +761,14 @@ fun Route.mapDetailRoute() {
                 .joinUploader()
                 .joinCurator()
                 .joinBookmarked(sess?.userId)
-                .select {
+                .selectAll()
+                .where {
                     Beatmap.id.inSubQuery(
                         Beatmap
                             .joinVersions()
                             .joinUploader()
-                            .slice(Beatmap.id)
-                            .select {
+                            .select(Beatmap.id)
+                            .where {
                                 Beatmap.deletedAt.isNull()
                                     .let { q ->
                                         if (it.automapper != true) q.and(Beatmap.declaredAi eq AiDeclarationType.None) else q
@@ -798,11 +809,12 @@ fun Route.mapDetailRoute() {
                 .joinVersions(true)
                 .joinUploader()
                 .joinCurator()
-                .select {
+                .selectAll()
+                .where {
                     Beatmap.id.inSubQuery(
                         Beatmap
-                            .slice(Beatmap.id)
-                            .select {
+                            .select(Beatmap.id)
+                            .where {
                                 Beatmap.deletedAt.isNull()
                             }
                             .orderBy(Beatmap.plays to SortOrder.DESC)
